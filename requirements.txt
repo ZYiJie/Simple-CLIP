@@ -1,0 +1,9 @@
+numpy==1.21.2
+pandas==1.4.2
+Pillow==9.2.0
+pytorch_pretrained_vit==0.0.7
+torch==1.11.0
+torchvision==0.12.0
+tqdm==4.60.0
+transformers==4.10.0
+wandb==0.12.13
