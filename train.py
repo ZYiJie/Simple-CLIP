@@ -14,14 +14,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam, SGD, AdamW
 from torch.utils.data import DataLoader, Dataset
-import torchvision.transforms as transforms
 from PIL import Image
-import torchvision.models as visual_models
-from pytorch_pretrained_vit import ViT
 
 import transformers
 print(f"transformers.__version__: {transformers.__version__}")
 from transformers import AutoTokenizer, BertModel, AutoConfig
+from transformers import AutoFeatureExtractor, AutoModelForImageClassification
 from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 transformers.logging.set_verbosity_error()
 
@@ -34,18 +32,17 @@ class CFG:
     valid_file = './data/IQR_dev.tsv'   
     img_key = 'filepath'
     caption_key = 'title'
-    max_text_len=34  
+    max_text_len=34
     image_size=224
-    text_ptm='/home/zyj/PTMs/chinese-roberta-wwm-ext/'
-    img_ptm='Resnet50'  # ['ViT', 'Resnet50', 'VGG16']
-    vit_name='B_16_imagenet1k'
-    output_dir = './checkpoints/tmp/'
+    text_ptm='roberta'
+    img_ptm='resnet50'
+    output_dir = f'{text_ptm}-{img_ptm}-saved'
     # 训练参数
     dim = 256
     device='cuda:0'
     epochs=10
-    learning_rate = 1e-4
-    batch_size=128
+    learning_rate = 1.5e-4 # 0.5 for large
+    batch_size=256
     eval_epoch = 1
     apex = True
     seed=42 
@@ -61,7 +58,14 @@ class CFG:
     log_step = 5
     wandb = True
     key_metrics = 'image_to_text_R@10'
-    
+
+ptm = {
+    "roberta": '/home/zyj/PTMs/chinese-roberta-wwm-ext/',
+    "roberta-large": '/home/zyj/PTMs/chinese-roberta-wwm-ext-large/',
+    "resnet50": '/home/zyj/PTMs/resnet-50/',
+    "vit": '/home/zyj/PTMs/vit-base-patch16-224/',
+    "vit-large": '/home/zyj/PTMs/vit-large-patch16-224/',
+}
 
 
 # %%
@@ -80,16 +84,12 @@ def seed_everything(seed=42):
 # %%
 class TrainDataset(Dataset):
     def __init__(self, input_file):
-        self.tokenizer = AutoTokenizer.from_pretrained(CFG.text_ptm)
+        self.tokenizer = AutoTokenizer.from_pretrained(ptm[CFG.text_ptm])
         data_df = pd.read_csv(input_file, sep='\t')
         self.img_paths = data_df[CFG.img_key].values
         self.texts = data_df[CFG.caption_key].values
-        img_size = CFG.image_size
 
-        self.transformation = transforms.Compose([
-            transforms.Resize((img_size, img_size)),
-            transforms.ToTensor(),
-        ])
+        self.feature_extractor = AutoFeatureExtractor.from_pretrained(ptm[CFG.img_ptm])
         
         print(f'load data from {input_file} len={len(self.texts)}')
 
@@ -104,9 +104,11 @@ class TrainDataset(Dataset):
                                 truncation=True, 
                                 return_tensors='pt', 
                                 padding="max_length",)
+        img_tensor = self.feature_extractor(Image.open(img_path).convert("RGB"), return_tensors="pt")
         for k,v in text_tensor.items():
             text_tensor[k] = v.squeeze()
-        img_tensor = self.transformation(Image.open(img_path).convert('RGB'))
+        for k,v in img_tensor.items():
+            img_tensor[k] = v.squeeze()
         # print(item, text, img_path, img_tensor.shape)
         return {'text':text_tensor, 'img':img_tensor}
 
@@ -143,20 +145,13 @@ class TextEncoder(nn.Module):
 
 # %%
 class ImageEncoder(nn.Module):
-    def __init__(self, ptm_name, device, vit_model_name=None):
+    def __init__(self, ptm_name, device):
         super().__init__()
-        assert ptm_name in ['ViT', 'Resnet50', 'VGG16']
-        if ptm_name == 'Resnet50':
-            self.model = visual_models.resnet50(pretrained=True)
-        elif ptm_name == 'ViT':
-            self.model = ViT(vit_model_name, pretrained=True)
-        else:
-            self.model = visual_models.vgg16(pretrained=True)
-        self.model.to(device)
+        self.model = AutoModelForImageClassification.from_pretrained(ptm_name)
         self.feat_dim = 1000
 
     def forward(self, inputs):
-        feature = self.model(inputs) # [batch_size, 1000]
+        feature = self.model(**inputs).logits # [batch_size, 1000]
         feature = F.normalize(feature, dim=-1)
         return feature
 
@@ -166,11 +161,11 @@ class ImageEncoder(nn.Module):
 
 # %%
 class SimpleCLIP(nn.Module):
-    def __init__(self, dim, text_ptm_name, img_ptm_name, device, freeze=False, vit_model_name=None):
+    def __init__(self, dim, text_ptm_name, img_ptm_name, device, freeze=False):
         super().__init__()
         self.device = device
         self.textencoder = TextEncoder(text_ptm_name, device, freeze=freeze)
-        self.imgencoder = ImageEncoder(img_ptm_name, device, vit_model_name)
+        self.imgencoder = ImageEncoder(img_ptm_name, device)
 
         self.text_projection = nn.Parameter(torch.empty(self.textencoder.feat_dim, dim)).to(device)
         self.img_projection = nn.Parameter(torch.empty(self.imgencoder.feat_dim, dim)).to(device)
@@ -238,7 +233,8 @@ def evaluate(model, valid_dataloader, device):
     tk0 = tqdm(enumerate(valid_dataloader),total=len(valid_dataloader), desc="[Dev]")
     total_loss = 0
     for step, batch in tk0:
-        batch['img'] = batch['img'].to(device)
+        for k,v in batch['img'].items():
+            batch['img'][k] = v.to(device)
         for k,v in batch['text'].items():
             batch['text'][k] = v.to(device)
         with torch.no_grad():
@@ -315,7 +311,8 @@ def train_eval(model, train_dataloader, valid_dataloader, save_path):
         tk0 = tqdm(enumerate(train_dataloader),total=len(train_dataloader), desc="Epoch: {}".format(cur_epc))
         for step, batch in tk0:
             total_step += 1
-            batch['img'] = batch['img'].to(device)
+            for k,v in batch['img'].items():
+                batch['img'][k] = v.to(device)
             for k,v in batch['text'].items():
                 batch['text'][k] = v.to(device)
             with torch.cuda.amp.autocast(enabled=CFG.apex):
@@ -353,10 +350,10 @@ if __name__ == '__main__':
     valid_dataloader = DataLoader(valid_dataset, batch_size=CFG.batch_size, num_workers=5)
     # 加载模型
     device = torch.device(CFG.device)
-    clipModel = SimpleCLIP(CFG.dim, CFG.text_ptm, CFG.img_ptm, device, freeze=False)
+    clipModel = SimpleCLIP(CFG.dim, ptm[CFG.text_ptm], ptm[CFG.img_ptm], device, freeze=False)
     
     if CFG.wandb:
-        wandb.init(project='SimpleCLIP', name=f'roberta-base-{CFG.img_ptm}-batch{CFG.batch_size}-dim{CFG.dim}')
+        wandb.init(project='SimpleCLIP', name=f'{CFG.text_ptm}-{CFG.img_ptm}-batch{CFG.batch_size}-dim{CFG.dim}')
     
     # 训练
     train_eval(clipModel, train_dataloader, valid_dataloader, CFG.output_dir)
