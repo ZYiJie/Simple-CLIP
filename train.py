@@ -1,4 +1,3 @@
-# %%
 #!/usr/bin/env python
 # coding: utf-8
 import os
@@ -18,57 +17,59 @@ from PIL import Image
 
 import transformers
 print(f"transformers.__version__: {transformers.__version__}")
-from transformers import AutoTokenizer, BertModel, AutoConfig
+from transformers import AutoTokenizer, AutoConfig, AutoModel
 from transformers import AutoFeatureExtractor, AutoModelForImageClassification
 from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 transformers.logging.set_verbosity_error()
 
-# %% [markdown]
+
 # ### 参数
 
-# %%
 class CFG:
-    train_file = './data/IQR_train.tsv'    
+    train_file = './data/pretrain.tsv'    
     valid_file = './data/IQR_dev.tsv'   
     img_key = 'filepath'
     caption_key = 'title'
-    max_text_len=34
-    image_size=224
-    text_ptm='roberta'
-    img_ptm='resnet50'
-    output_dir = f'{text_ptm}-{img_ptm}-saved'
+    max_text_len = 34
+    text_ptm = 'roberta-large'
+    img_ptm = 'vit'
+    output_dir = f'checkpoints/pretrain-{text_ptm}-{img_ptm}-saved'
+    pretrained = True                    # 是否加载预训练模型权重, False为仅加载模型结构随机初始化权重
+    freeze = False                       # 是否冻结textEncoder
+    load_model = None                    # 加载模型路径
     # 训练参数
-    dim = 256
-    device='cuda:0'
-    epochs=10
-    learning_rate = 1.5e-4 # 0.5 for large
-    batch_size=256
-    eval_epoch = 1
-    apex = True
-    seed=42 
+    dim = 2048
+    device = 'cuda:0'
+    epochs = 3
+    learning_rate = 1e-4                 # 0.5e-4 for large; 2.5e-4 for base
+    batch_size = 128
+    accumulation_steps = 8               # 梯度累加
+    eval_epoch = 1                       # 每过几个epoch进行eval
+    apex = True                          # 是否使用混合精度加速
+    seed = 42 
     # scheduler参数
-    scheduler='cosine'                   # ['linear', 'cosine'] # lr scheduler 类型
-    last_epoch=-1                        # 从第 last_epoch +1 个epoch开始训练
-    batch_scheduler=True                 # 是否每个step结束后更新 lr scheduler
-    weight_decay=0.01
+    scheduler = 'cosine'                 # ['linear', 'cosine'] # lr scheduler 类型
+    last_epoch = -1                      # 从第 last_epoch +1 个epoch开始训练
+    batch_scheduler = True               # 是否每个step结束后更新 lr scheduler
+    weight_decay = 0.01
     num_warmup_steps = 0
-    num_cycles=0.5                    # 如果使用 cosine lr scheduler， 该参数决定学习率曲线的形状，0.5代表半个cosine曲线
+    num_cycles = 0.5                     # 如果使用 cosine lr scheduler， 该参数决定学习率曲线的形状，0.5代表半个cosine曲线
     
     # log参数
-    log_step = 5
+    log_step = 100
     wandb = True
     key_metrics = 'image_to_text_R@10'
 
 ptm = {
-    "roberta": '/home/zyj/PTMs/chinese-roberta-wwm-ext/',
-    "roberta-large": '/home/zyj/PTMs/chinese-roberta-wwm-ext-large/',
-    "resnet50": '/home/zyj/PTMs/resnet-50/',
-    "vit": '/home/zyj/PTMs/vit-base-patch16-224/',
-    "vit-large": '/home/zyj/PTMs/vit-large-patch16-224/',
+    "roberta": '/home/yjw/ZYJ_WorkSpace/PTMs/chinese-roberta-wwm-ext/',
+    "roberta-large": '/home/yjw/ZYJ_WorkSpace/PTMs/chinese-roberta-wwm-ext-large/',
+    "resnet50": '/home/yjw/ZYJ_WorkSpace/PTMs/resnet-50/',
+    "resnet152": '/home/yjw/ZYJ_WorkSpace/PTMs/resnet-152/',
+    "vit": '/home/yjw/ZYJ_WorkSpace/PTMs/vit-base-patch16-224/',
+    "vit-large": '/home/yjw/ZYJ_WorkSpace/PTMs/vit-large-patch16-224/',
 }
 
 
-# %%
 #=======设置全局seed保证结果可复现====
 def seed_everything(seed=42):
     random.seed(seed)
@@ -78,10 +79,9 @@ def seed_everything(seed=42):
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
 
-# %% [markdown]
+
 # ### 数据预处理
 
-# %%
 class TrainDataset(Dataset):
     def __init__(self, input_file):
         self.tokenizer = AutoTokenizer.from_pretrained(ptm[CFG.text_ptm])
@@ -97,7 +97,7 @@ class TrainDataset(Dataset):
         return len(self.texts)
 
     def __getitem__(self, item):
-        text = self.texts[item]
+        text = str(self.texts[item])
         img_path = self.img_paths[item]
         text_tensor = self.tokenizer(text, 
                                 max_length=CFG.max_text_len, 
@@ -112,18 +112,18 @@ class TrainDataset(Dataset):
         # print(item, text, img_path, img_tensor.shape)
         return {'text':text_tensor, 'img':img_tensor}
 
-# %% [markdown]
+
 # ### 模型定义
 
-# %% [markdown]
 # #### TextEncoder
 
-# %%
 class TextEncoder(nn.Module):
-    def __init__(self, ptm_name, device, freeze=False):
+    def __init__(self, ptm_name, device, pretrained, freeze=False):
         super().__init__()
-        self.model = BertModel.from_pretrained(ptm_name)
-        self.model.to(device)
+        if pretrained:
+            self.model = AutoModel.from_pretrained(ptm_name)
+        else:
+            self.model = AutoModel.from_config(AutoConfig.from_pretrained(ptm_name))
         self.feat_dim = AutoConfig.from_pretrained(ptm_name).hidden_size
 
         self.freeze = freeze
@@ -140,14 +140,15 @@ class TextEncoder(nn.Module):
         feature = F.normalize(feature, dim=-1)
         return feature
 
-# %% [markdown]
 # #### ImageEncoder
 
-# %%
 class ImageEncoder(nn.Module):
-    def __init__(self, ptm_name, device):
+    def __init__(self, ptm_name, pretrained):
         super().__init__()
-        self.model = AutoModelForImageClassification.from_pretrained(ptm_name)
+        if pretrained:
+            self.model = AutoModelForImageClassification.from_pretrained(ptm_name)
+        else:
+            self.model = AutoModelForImageClassification.from_config(AutoConfig.from_pretrained(ptm_name))
         self.feat_dim = 1000
 
     def forward(self, inputs):
@@ -156,16 +157,15 @@ class ImageEncoder(nn.Module):
         return feature
 
 
-# %% [markdown]
+
 # #### SimpleCLIP
 
-# %%
 class SimpleCLIP(nn.Module):
-    def __init__(self, dim, text_ptm_name, img_ptm_name, device, freeze=False):
+    def __init__(self, dim, text_ptm_name, img_ptm_name, device, pretrained, freeze=False):
         super().__init__()
         self.device = device
-        self.textencoder = TextEncoder(text_ptm_name, device, freeze=freeze)
-        self.imgencoder = ImageEncoder(img_ptm_name, device)
+        self.textencoder = TextEncoder(text_ptm_name, device, pretrained=pretrained, freeze=freeze)
+        self.imgencoder = ImageEncoder(img_ptm_name, pretrained=pretrained)
 
         self.text_projection = nn.Parameter(torch.empty(self.textencoder.feat_dim, dim)).to(device)
         self.img_projection = nn.Parameter(torch.empty(self.imgencoder.feat_dim, dim)).to(device)
@@ -200,13 +200,9 @@ class SimpleCLIP(nn.Module):
             return text_feat, img_feat, logit_scale
 
 
-# %% [markdown]
 # ### 主程序
-
-# %% [markdown]
 # #### evaluate
 
-# %%
 def get_metrics(image_features, text_features, logit_scale):
     metrics = {}
     logits_per_image = (logit_scale * image_features @ text_features.t()).detach().cpu()
@@ -252,17 +248,14 @@ def evaluate(model, valid_dataloader, device):
     metrics['eval_loss'] = total_loss / len(valid_dataloader)
     return metrics
 
-
-# %% [markdown]
 # #### train loop
 
-# %%
 def train_eval(model, train_dataloader, valid_dataloader, save_path):
     assert CFG.device.startswith('cuda') or CFG.device == 'cpu', ValueError("Invalid device.")
     device = torch.device(CFG.device)
     best_score = 0
     total_step = 0
-    model.to(device)
+    model = model.to(device)
     scaler = torch.cuda.amp.GradScaler(enabled=CFG.apex)
     if not len(train_dataloader):
         raise EOFError("Empty train_dataloader.")
@@ -277,7 +270,7 @@ def train_eval(model, train_dataloader, valid_dataloader, save_path):
         {"params": [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], "weight_decay": 0.0}]
     optimizer = AdamW(optimizer_grouped_parameters, lr=CFG.learning_rate, weight_decay=CFG.weight_decay)
     
-    num_train_steps = int(len(train_dataloader) * CFG.epochs)
+    num_train_steps = int(len(train_dataloader) * CFG.epochs / CFG.accumulation_steps)
     if CFG.scheduler=='cosine':
         scheduler = get_cosine_schedule_with_warmup(
                     optimizer, 
@@ -318,11 +311,12 @@ def train_eval(model, train_dataloader, valid_dataloader, save_path):
             with torch.cuda.amp.autocast(enabled=CFG.apex):
                 loss, _, _, _ = model(batch['text'], batch['img'], outputLoss=True)
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-            if CFG.batch_scheduler:
-                scheduler.step()
+            if (step+1) % CFG.accumulation_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                if CFG.batch_scheduler:
+                    scheduler.step()
             training_loss += loss.item()
             tk0.set_postfix(Epoch=cur_epc, Loss=training_loss/(step+1))
             if CFG.wandb and (step + 1) % CFG.log_step == 0:
@@ -331,10 +325,8 @@ def train_eval(model, train_dataloader, valid_dataloader, save_path):
         
     torch.cuda.empty_cache()          
 
-# %% [markdown]
 # #### 训练过程
 
-# %%
 if __name__ == '__main__':
     seed_everything(seed=42)
     if not os.path.exists(CFG.output_dir):
@@ -350,8 +342,10 @@ if __name__ == '__main__':
     valid_dataloader = DataLoader(valid_dataset, batch_size=CFG.batch_size, num_workers=5)
     # 加载模型
     device = torch.device(CFG.device)
-    clipModel = SimpleCLIP(CFG.dim, ptm[CFG.text_ptm], ptm[CFG.img_ptm], device, freeze=False)
-    
+    clipModel = SimpleCLIP(CFG.dim, ptm[CFG.text_ptm], ptm[CFG.img_ptm], device, pretrained=CFG.pretrained,freeze=CFG.freeze)
+    if CFG.load_model is not None:
+        clipModel.load_state_dict(torch.load(CFG.load_model))
+        print(f"load state from {CFG.load_model}")
     if CFG.wandb:
         wandb.init(project='SimpleCLIP', name=f'{CFG.text_ptm}-{CFG.img_ptm}-batch{CFG.batch_size}-dim{CFG.dim}')
     
