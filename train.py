@@ -9,16 +9,13 @@ from pprint import pprint
 
 from tqdm import tqdm
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from model import SimpleCLIP
 from torch.optim import Adam, SGD, AdamW
 from torch.utils.data import DataLoader, Dataset
 from PIL import Image
-
 import transformers
+from transformers import AutoFeatureExtractor, AutoTokenizer
 print(f"transformers.__version__: {transformers.__version__}")
-from transformers import AutoTokenizer, AutoConfig, AutoModel
-from transformers import AutoFeatureExtractor, AutoModelForImageClassification
 from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 transformers.logging.set_verbosity_error()
 
@@ -113,93 +110,6 @@ class TrainDataset(Dataset):
         return {'text':text_tensor, 'img':img_tensor}
 
 
-# ### 模型定义
-
-# #### TextEncoder
-
-class TextEncoder(nn.Module):
-    def __init__(self, ptm_name, device, pretrained, freeze=False):
-        super().__init__()
-        if pretrained:
-            self.model = AutoModel.from_pretrained(ptm_name)
-        else:
-            self.model = AutoModel.from_config(AutoConfig.from_pretrained(ptm_name))
-        self.feat_dim = AutoConfig.from_pretrained(ptm_name).hidden_size
-
-        self.freeze = freeze
-        if freeze:
-            for name ,param in self.model.named_parameters():
-                param.requires_grad = False
-        
-    def forward(self, inputs):
-        if self.freeze:
-            self.model.eval()
-        last_hidden_state = self.model(**inputs).last_hidden_state # [batch_size, seq_len, hidden_size]
-        feature = torch.mean(last_hidden_state, axis=1) # [batch_size, hidden_size]
-
-        feature = F.normalize(feature, dim=-1)
-        return feature
-
-# #### ImageEncoder
-
-class ImageEncoder(nn.Module):
-    def __init__(self, ptm_name, pretrained):
-        super().__init__()
-        if pretrained:
-            self.model = AutoModelForImageClassification.from_pretrained(ptm_name)
-        else:
-            self.model = AutoModelForImageClassification.from_config(AutoConfig.from_pretrained(ptm_name))
-        self.feat_dim = 1000
-
-    def forward(self, inputs):
-        feature = self.model(**inputs).logits # [batch_size, 1000]
-        feature = F.normalize(feature, dim=-1)
-        return feature
-
-
-
-# #### SimpleCLIP
-
-class SimpleCLIP(nn.Module):
-    def __init__(self, dim, text_ptm_name, img_ptm_name, device, pretrained, freeze=False):
-        super().__init__()
-        self.device = device
-        self.textencoder = TextEncoder(text_ptm_name, device, pretrained=pretrained, freeze=freeze)
-        self.imgencoder = ImageEncoder(img_ptm_name, pretrained=pretrained)
-
-        self.text_projection = nn.Parameter(torch.empty(self.textencoder.feat_dim, dim)).to(device)
-        self.img_projection = nn.Parameter(torch.empty(self.imgencoder.feat_dim, dim)).to(device)
-        self.logit_scale = nn.Parameter(torch.ones([])).to(device)
-        self.init_parameters()
-    
-    def init_parameters(self):
-        nn.init.constant_(self.logit_scale, np.log(1 / 0.07))
-        nn.init.normal_(self.text_projection, std=0.02)
-        nn.init.normal_(self.img_projection, std=0.02)
-
-    def loss(self, text_feat, img_feat, logit_scale):
-        labels = torch.arange(text_feat.shape[0], device=self.device, dtype=torch.long)
-
-        logits_per_image = logit_scale * img_feat @ text_feat.T   # [batch_size, batch_size]
-        logits_per_text = logit_scale * text_feat @ img_feat.T   # [batch_size, batch_size]
-        
-        total_loss = (
-            F.cross_entropy(logits_per_image, labels) +
-            F.cross_entropy(logits_per_text, labels)
-            ) / 2
-        return total_loss
-
-    def forward(self, text_inputs, img_inputs, outputLoss=False):
-        text_feat = self.textencoder(text_inputs) @ self.text_projection # [batch_size, dim]
-        img_feat = self.imgencoder(img_inputs) @ self.img_projection # [batch_size, dim]
-        logit_scale = self.logit_scale.exp()
-        if outputLoss:
-            loss = self.loss(text_feat, img_feat, logit_scale)
-            return loss, text_feat, img_feat, logit_scale
-        else:
-            return text_feat, img_feat, logit_scale
-
-
 # ### 主程序
 # #### evaluate
 
@@ -286,19 +196,6 @@ def train_eval(model, train_dataloader, valid_dataloader, save_path):
     
     for cur_epc in range(int(CFG.epochs)):
         
-        if cur_epc % CFG.eval_epoch == 0:
-            metrics = evaluate(model, valid_dataloader, device)
-            print(f"eval metrics = ")
-            pprint(metrics)
-            if CFG.wandb:
-                wandb.log(metrics, step=total_step)
-            if cur_epc > 0 and metrics[CFG.key_metrics] >= best_score:
-                best_score = metrics[CFG.key_metrics]
-                # model_save_path = os.path.join(save_path,f'epoch{cur_epc}.pt') # 保留所有checkpoint
-                model_save_path = os.path.join(save_path,f'best_checkpoint.pt') # 保留最优checkpoint
-                torch.save(model.state_dict(), model_save_path)
-                print(f'save at {model_save_path}')
-        
         training_loss = 0
         model.train()
         tk0 = tqdm(enumerate(train_dataloader),total=len(train_dataloader), desc="Epoch: {}".format(cur_epc))
@@ -322,7 +219,18 @@ def train_eval(model, train_dataloader, valid_dataloader, save_path):
             if CFG.wandb and (step + 1) % CFG.log_step == 0:
                 wandb.log({'train_loss':loss, 'lr':optimizer.param_groups[0]["lr"], 'epoch': cur_epc},
                           step=total_step)
-        
+        if cur_epc % CFG.eval_epoch == 0:
+            metrics = evaluate(model, valid_dataloader, device)
+            print(f"eval metrics = ")
+            pprint(metrics)
+            if CFG.wandb:
+                wandb.log(metrics, step=total_step)
+            if cur_epc > 0 and metrics[CFG.key_metrics] >= best_score:
+                best_score = metrics[CFG.key_metrics]
+                # model_save_path = os.path.join(save_path,f'epoch{cur_epc}.pt') # 保留所有checkpoint
+                model_save_path = os.path.join(save_path,f'best_checkpoint.pt') # 保留最优checkpoint
+                torch.save(model.state_dict(), model_save_path)
+                print(f'save at {model_save_path}')
     torch.cuda.empty_cache()          
 
 # #### 训练过程
