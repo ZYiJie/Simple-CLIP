@@ -225,7 +225,7 @@ def train_eval(model, train_dataloader, valid_dataloader, save_path):
             pprint(metrics)
             if CFG.wandb:
                 wandb.log(metrics, step=total_step)
-            if cur_epc > 0 and metrics[CFG.key_metrics] >= best_score:
+            if metrics[CFG.key_metrics] >= best_score:
                 best_score = metrics[CFG.key_metrics]
                 # model_save_path = os.path.join(save_path,f'epoch{cur_epc}.pt') # 保留所有checkpoint
                 model_save_path = os.path.join(save_path,f'best_checkpoint.pt') # 保留最优checkpoint
